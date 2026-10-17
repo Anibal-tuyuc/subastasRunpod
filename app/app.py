@@ -501,30 +501,74 @@ if st.session_state.usuario is None:
     col_a, col_b, col_c = st.columns([1, 2, 1])
     with col_b:
         tab_login, tab_registro = st.tabs(["Iniciar Sesión", "Registrarse"])
+
+        # NOTA AUTOCOMPLETADO: cuando el navegador rellena los campos con
+        # datos guardados (password manager), Streamlit NO recibe el evento
+        # de cambio y los valores quedan vacios en session_state aunque se
+        # vean llenos. El JS de abajo escucha el evento 'animationstart' que
+        # Chrome dispara sobre inputs autocompletados (truco :-webkit-autofill)
+        # y fuerza un evento 'input' nativo para que Streamlit capture el valor.
+        components.html("""
+<style>
+input:-webkit-autofill { animation-name: onAutoFillStart; }
+@keyframes onAutoFillStart { from {} to {} }
+</style>
+<script>
+(function() {
+    var doc = window.parent.document;
+    function fixAutofill() {
+        doc.querySelectorAll('input').forEach(function(inp) {
+            if (inp.dataset.afFix) return;
+            inp.dataset.afFix = "1";
+            inp.addEventListener('animationstart', function(e) {
+                if (e.animationName === 'onAutoFillStart') {
+                    inp.dispatchEvent(new Event('input', { bubbles: true }));
+                    inp.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            });
+        });
+    }
+    new MutationObserver(fixAutofill).observe(doc.body, {childList: true, subtree: true});
+    fixAutofill();
+})();
+</script>
+""", height=0)
+
         with tab_login:
-            email = st.text_input("Email", key="login_email")
-            pwd = st.text_input("Contraseña", type="password", key="login_pwd")
+            email = st.text_input("Email", key="login_email", autocomplete="email")
+            pwd = st.text_input("Contraseña", type="password", key="login_pwd",
+                                autocomplete="current-password")
             if st.button("Entrar", width='stretch'):
-                u_log = login(email, pwd)
-                if u_log:
-                    st.session_state.usuario = u_log
-                    st.query_params["uid"] = str(u_log["id_usuario"])
-                    st.rerun()
+                if not (email and email.strip() and pwd):
+                    st.warning("Completa email y contraseña. Si usaste autocompletado, "
+                               "haz clic en cada campo y escribe un carácter (o borra uno) "
+                               "para que se registre el valor.")
                 else:
-                    st.error("Credenciales inválidas o usuario inactivo.")
+                    u_log = login(email.strip(), pwd)
+                    if u_log:
+                        st.session_state.usuario = u_log
+                        st.query_params["uid"] = str(u_log["id_usuario"])
+                        st.rerun()
+                    else:
+                        st.error("Credenciales inválidas o usuario inactivo.")
         with tab_registro:
-            n = st.text_input("Nombre")
-            a = st.text_input("Apellido")
-            e = st.text_input("Email", key="reg_email")
-            p = st.text_input("Contraseña (mín. 6 caracteres)", type="password", key="reg_pwd")
-            p2 = st.text_input("Confirmar contraseña", type="password", key="reg_pwd2")
+            n = st.text_input("Nombre", autocomplete="given-name")
+            a = st.text_input("Apellido", autocomplete="family-name")
+            e = st.text_input("Email", key="reg_email", autocomplete="email")
+            p = st.text_input("Contraseña (mín. 6 caracteres)", type="password",
+                              key="reg_pwd", autocomplete="new-password")
+            p2 = st.text_input("Confirmar contraseña", type="password",
+                               key="reg_pwd2", autocomplete="new-password")
             if st.button("Crear cuenta", width='stretch'):
-                if not (n and a and e and p):
-                    st.warning("Completa todos los campos.")
+                if not (n and n.strip() and a and a.strip()
+                        and e and e.strip() and p):
+                    st.warning("Completa todos los campos. Si usaste autocompletado, "
+                               "haz clic en cada campo y escribe un carácter (o borra uno) "
+                               "para que se registre el valor.")
                 elif p != p2:
                     st.error("Las contraseñas no coinciden.")
                 else:
-                    ok, msg = registrar_usuario(n, a, e, p)
+                    ok, msg = registrar_usuario(n.strip(), a.strip(), e.strip(), p)
                     (st.success if ok else st.error)(msg)
     st.stop()
 

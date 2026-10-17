@@ -55,22 +55,72 @@ def get_connection():
         f"SERVER={DB_SERVER};DATABASE={DB_NAME};{auth}"
         "Encrypt=yes;TrustServerCertificate=yes;Connection Timeout=15;"
     )
-    return pyodbc.connect(conn_str)
+    # autocommit=True evita que la conexion quede "ocupada" con transacciones
+    # abiertas entre llamadas (error 'Connection is busy with results').
+    conn = pyodbc.connect(conn_str, autocommit=True)
+    return conn
 
 
 def query(sql, params=()):
+    """SELECT generico: devuelve lista de dicts. Cierra el cursor siempre
+    (consume todos los resultsets) para no dejar la conexion ocupada."""
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute(sql, params)
-    cols = [c[0] for c in cursor.description] if cursor.description else []
-    return [dict(zip(cols, row)) for row in cursor.fetchall()]
+    try:
+        cursor.execute(sql, params)
+        cols = [c[0] for c in cursor.description] if cursor.description else []
+        filas = [dict(zip(cols, row)) for row in cursor.fetchall()]
+        # Consumir resultsets extra (los SPs a veces devuelven varios)
+        while cursor.nextset():
+            pass
+        return filas
+    finally:
+        cursor.close()
 
 
 def ejecutar_sp(nombre_sp, params=()):
+    """Ejecuta un SP. Consume TODOS los resultsets (el motor de pujas
+    devuelve un SELECT final con el resultado) y cierra el cursor."""
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute(f"EXEC {nombre_sp} " + ", ".join("?" * len(params)), params)
-    conn.commit()
+    try:
+        cursor.execute(f"EXEC {nombre_sp} " + ", ".join("?" * len(params)), params)
+        resultados = []
+        if cursor.description:
+            cols = [c[0] for c in cursor.description]
+            resultados = [dict(zip(cols, row)) for row in cursor.fetchall()]
+        while cursor.nextset():
+            pass
+        return resultados
+    finally:
+        cursor.close()
+
+
+class transaccion:
+    """Context manager para bloques multi-statement que necesitan atomicidad
+    (commit/rollback real). La conexion global corre con autocommit=True para
+    evitar el error 'Connection is busy'; aqui lo apagamos temporalmente y lo
+    restauramos al salir. Uso:
+        with transaccion() as cur:
+            cur.execute("INSERT ...")
+            cur.execute("INSERT ...")   # si algo falla -> rollback automatico
+    """
+    def __enter__(self):
+        self.conn = get_connection()
+        self.conn.autocommit = False
+        self.cur = self.conn.cursor()
+        return self.cur
+
+    def __exit__(self, tipo_exc, exc, tb):
+        try:
+            if tipo_exc is None:
+                self.conn.commit()
+            else:
+                self.conn.rollback()
+        finally:
+            self.cur.close()
+            self.conn.autocommit = True
+        return False  # no suprimir la excepcion
 
 
 # ============================================================
@@ -311,29 +361,27 @@ def login_por_id(id_usuario):
 def registrar_usuario(nombre, apellido, email, password):
     if len(password) < 6:
         return False, "La contraseña debe tener al menos 6 caracteres."
-    conn = get_connection()
-    cursor = conn.cursor()
     id_verif = query(
         "SELECT TOP 1 id_estado_verificacion FROM Estados_Verificacion ORDER BY id_estado_verificacion"
     )
     if not id_verif:
         return False, "No hay estados de verificacion cargados en la BD."
     try:
-        cursor.execute(
-            "INSERT INTO Usuarios (nombre, apellido, email, password_hash, "
-            "id_estado_verificacion, fecha_registro, activo) "
-            "VALUES (?, ?, ?, ?, ?, dbo.fn_AhoraGT(), 1)",
-            (nombre, apellido, email, _hashear(password),
-             id_verif[0]["id_estado_verificacion"]),
-        )
-        # Todo usuario nuevo entra como postor
-        cursor.execute(
-            "INSERT INTO Usuario_Roles (id_usuario, id_rol, fecha_asignacion) "
-            "SELECT id_usuario, 2, dbo.fn_AhoraGT() FROM Usuarios WHERE email = ? "
-            "AND NOT EXISTS (SELECT 1 FROM Usuario_Roles ur "
-            "                WHERE ur.id_usuario = Usuarios.id_usuario AND ur.id_rol = 2)",
-            (email,))
-        conn.commit()
+        with transaccion() as cursor:
+            cursor.execute(
+                "INSERT INTO Usuarios (nombre, apellido, email, password_hash, "
+                "id_estado_verificacion, fecha_registro, activo) "
+                "VALUES (?, ?, ?, ?, ?, dbo.fn_AhoraGT(), 1)",
+                (nombre, apellido, email, _hashear(password),
+                 id_verif[0]["id_estado_verificacion"]),
+            )
+            # Todo usuario nuevo entra como postor
+            cursor.execute(
+                "INSERT INTO Usuario_Roles (id_usuario, id_rol, fecha_asignacion) "
+                "SELECT id_usuario, 2, dbo.fn_AhoraGT() FROM Usuarios WHERE email = ? "
+                "AND NOT EXISTS (SELECT 1 FROM Usuario_Roles ur "
+                "                WHERE ur.id_usuario = Usuarios.id_usuario AND ur.id_rol = 2)",
+                (email,))
         return True, "Registro exitoso. Ya puedes iniciar sesion."
     except pyodbc.IntegrityError:
         return False, "Ese email ya esta registrado."
@@ -850,31 +898,28 @@ elif pagina == "📦 Mis Artículos":
                             id_ub_e = (next((x["id_ubicacion"] for x in ubics
                                              if x["nombre_ubicacion"] == e_ub), None)
                                        if e_ub != "— sin asignar —" else None)
-                            conn = get_connection()
-                            cur = conn.cursor()
                             try:
-                                cur.execute(
-                                    "UPDATE Articulos SET id_categoria=?, id_estado_fisico=?, "
-                                    "codigo_moneda=?, titulo=?, descripcion=?, anio_fabricacion=?, "
-                                    "procedencia=?, precio_base_reserva=?, id_ubicacion_actual=? "
-                                    "WHERE id_articulo=?",
-                                    (id_cat_e, id_ef_e, e_mon, e_tit.strip(),
-                                     e_desc.strip() or None, (e_anio or None),
-                                     e_proc.strip() or None, e_res, id_ub_e, a["id_articulo"]))
-                                # Reemplazo simple de imagenes: borrar y reinsertar en orden
-                                cur.execute("DELETE FROM Imagenes_Articulo WHERE id_articulo = ?",
-                                            (a["id_articulo"],))
-                                imgs_e = [x.strip() for x in (e_url1, e_url2, e_url3) if x and x.strip()]
-                                for i, url_img in enumerate(imgs_e, start=1):
+                                with transaccion() as cur:
                                     cur.execute(
-                                        "INSERT INTO Imagenes_Articulo (id_articulo, url, orden, "
-                                        "es_portada) VALUES (?, ?, ?, ?)",
-                                        (a["id_articulo"], url_img, i, 1 if i == 1 else 0))
-                                conn.commit()
+                                        "UPDATE Articulos SET id_categoria=?, id_estado_fisico=?, "
+                                        "codigo_moneda=?, titulo=?, descripcion=?, anio_fabricacion=?, "
+                                        "procedencia=?, precio_base_reserva=?, id_ubicacion_actual=? "
+                                        "WHERE id_articulo=?",
+                                        (id_cat_e, id_ef_e, e_mon, e_tit.strip(),
+                                         e_desc.strip() or None, (e_anio or None),
+                                         e_proc.strip() or None, e_res, id_ub_e, a["id_articulo"]))
+                                    # Reemplazo simple de imagenes: borrar y reinsertar en orden
+                                    cur.execute("DELETE FROM Imagenes_Articulo WHERE id_articulo = ?",
+                                                (a["id_articulo"],))
+                                    imgs_e = [x.strip() for x in (e_url1, e_url2, e_url3) if x and x.strip()]
+                                    for i, url_img in enumerate(imgs_e, start=1):
+                                        cur.execute(
+                                            "INSERT INTO Imagenes_Articulo (id_articulo, url, orden, "
+                                            "es_portada) VALUES (?, ?, ?, ?)",
+                                            (a["id_articulo"], url_img, i, 1 if i == 1 else 0))
                                 st.success(f"Artículo #{a['id_articulo']} actualizado. ✅")
                                 st.rerun()
                             except pyodbc.Error as ex:
-                                conn.rollback()
                                 st.error(f"Error actualizando: {ex.args[-1] if ex.args else ex}")
 
     # ---------------- REGISTRAR NUEVO ----------------
@@ -1019,53 +1064,50 @@ elif pagina == "📦 Mis Artículos":
                 urls_finales += urls_manual
 
                 # 2) Insertar articulo + imagenes + certificado + pedigree
-                conn = get_connection()
-                cur = conn.cursor()
                 try:
-                    # OUTPUT INSERTED: devuelve el id en el mismo batch
-                    # (SCOPE_IDENTITY() en un execute aparte devuelve NULL)
-                    cur.execute(
-                        "INSERT INTO Articulos (id_vendedor, id_categoria, id_estado_fisico, "
-                        "id_estado_articulo, codigo_moneda, titulo, descripcion, "
-                        "anio_fabricacion, procedencia, precio_base_reserva, fecha_ingreso, "
-                        "id_ubicacion_actual) "
-                        "OUTPUT INSERTED.id_articulo "
-                        "VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, dbo.fn_AhoraGT(), ?)",
-                        (u["id_usuario"], id_cat, id_ef, moneda, titulo.strip(),
-                         desc.strip() or None, (anio or None), proced.strip() or None,
-                         reserva, id_ub))
-                    id_art = int(cur.fetchone()[0])
-
-                    for i, url_img in enumerate(urls_finales, start=1):
+                    with transaccion() as cur:
+                        # OUTPUT INSERTED: devuelve el id en el mismo batch
+                        # (SCOPE_IDENTITY() en un execute aparte devuelve NULL)
                         cur.execute(
-                            "INSERT INTO Imagenes_Articulo (id_articulo, url, orden, es_portada) "
-                            "VALUES (?, ?, ?, ?)",
-                            (id_art, url_img, i, 1 if i == 1 else 0))
+                            "INSERT INTO Articulos (id_vendedor, id_categoria, id_estado_fisico, "
+                            "id_estado_articulo, codigo_moneda, titulo, descripcion, "
+                            "anio_fabricacion, procedencia, precio_base_reserva, fecha_ingreso, "
+                            "id_ubicacion_actual) "
+                            "OUTPUT INSERTED.id_articulo "
+                            "VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, dbo.fn_AhoraGT(), ?)",
+                            (u["id_usuario"], id_cat, id_ef, moneda, titulo.strip(),
+                             desc.strip() or None, (anio or None), proced.strip() or None,
+                             reserva, id_ub))
+                        id_art = int(cur.fetchone()[0])
 
-                    if num_reg.strip():
-                        id_ent = next(x["id_entidad_emisora"] for x in ents if x["nombre"] == ent)
-                        cur.execute(
-                            "INSERT INTO Certificados_Autenticidad (id_articulo, id_entidad_emisora, "
-                            "numero_registro, fecha_emision, url_documento, "
-                            "verificado_por_plataforma) VALUES (?, ?, ?, ?, ?, 0)",
-                            (id_art, id_ent, num_reg.strip(),
-                             fecha_em if fecha_em else None, url_doc.strip() or None))
+                        for i, url_img in enumerate(urls_finales, start=1):
+                            cur.execute(
+                                "INSERT INTO Imagenes_Articulo (id_articulo, url, orden, es_portada) "
+                                "VALUES (?, ?, ?, ?)",
+                                (id_art, url_img, i, 1 if i == 1 else 0))
 
-                    if famoso.strip() or evento.strip() or hist.strip():
-                        cur.execute(
-                            "INSERT INTO Historial_Pedigree_Articulos (id_articulo, "
-                            "propietario_anterior_famoso, evento_destacado, descripcion_historica) "
-                            "VALUES (?, ?, ?, ?)",
-                            (id_art, famoso.strip() or None, evento.strip() or None,
-                             hist.strip() or ""))
+                        if num_reg.strip():
+                            id_ent = next(x["id_entidad_emisora"] for x in ents if x["nombre"] == ent)
+                            cur.execute(
+                                "INSERT INTO Certificados_Autenticidad (id_articulo, id_entidad_emisora, "
+                                "numero_registro, fecha_emision, url_documento, "
+                                "verificado_por_plataforma) VALUES (?, ?, ?, ?, ?, 0)",
+                                (id_art, id_ent, num_reg.strip(),
+                                 fecha_em if fecha_em else None, url_doc.strip() or None))
 
-                    conn.commit()
+                        if famoso.strip() or evento.strip() or hist.strip():
+                            cur.execute(
+                                "INSERT INTO Historial_Pedigree_Articulos (id_articulo, "
+                                "propietario_anterior_famoso, evento_destacado, descripcion_historica) "
+                                "VALUES (?, ?, ?, ?)",
+                                (id_art, famoso.strip() or None, evento.strip() or None,
+                                 hist.strip() or ""))
+
                     msg_drive = (f"{len(archivos)} subida(s) a Cloudinary + " if archivos else "")
                     st.success(f"Artículo #{id_art} registrado ({msg_drive}"
                                f"{len(urls_finales)} imagen(es) en total). 🎉 "
                                "Un Admin ya puede crearle una subasta desde 🛠️ Admin.")
                 except pyodbc.Error as ex:
-                    conn.rollback()
                     st.error(f"Error registrando: {ex.args[-1] if ex.args else ex}")
 
 # ============================================================
@@ -1161,34 +1203,31 @@ elif pagina == "🛠️ Admin":
                 if fin <= inicio:
                     st.error("La fecha de cierre debe ser posterior a la de inicio.")
                 else:
-                    conn = get_connection()
-                    cur = conn.cursor()
                     try:
                         id_estado = query(
                             "SELECT id_estado_subasta FROM Estados_Subasta WHERE nombre = 'Activa'"
                         )[0]["id_estado_subasta"]
-                        cur.execute(
-                            "INSERT INTO Subastas (id_articulo, id_estado_subasta, id_politica, "
-                            "id_usuario_creador, fecha_hora_inicio, fecha_hora_fin, "
-                            "extension_anti_sniping_seg, puja_actual_maxima, total_pujas, "
-                            "version, fecha_creacion, monto_apertura) "
-                            "OUTPUT INSERTED.id_subasta "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 1, dbo.fn_AhoraGT(), ?)",
-                            (art_obj["id_articulo"], id_estado, opts_pol[pol_sel],
-                             u["id_usuario"], inicio, fin, int(antisnip), apertura))
-                        id_nueva = int(cur.fetchone()[0])
-                        cur.executemany(
-                            "INSERT INTO Reglas_Incremento (id_subasta, monto_desde, "
-                            "monto_hasta, incremento_minimo) VALUES (?, ?, ?, ?)",
-                            [(id_nueva, 0.0, 1000.0, inc1),
-                             (id_nueva, 1000.0, 10000.0, inc2),
-                             (id_nueva, 10000.0, None, inc3)])
-                        conn.commit()
+                        with transaccion() as cur:
+                            cur.execute(
+                                "INSERT INTO Subastas (id_articulo, id_estado_subasta, id_politica, "
+                                "id_usuario_creador, fecha_hora_inicio, fecha_hora_fin, "
+                                "extension_anti_sniping_seg, puja_actual_maxima, total_pujas, "
+                                "version, fecha_creacion, monto_apertura) "
+                                "OUTPUT INSERTED.id_subasta "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 1, dbo.fn_AhoraGT(), ?)",
+                                (art_obj["id_articulo"], id_estado, opts_pol[pol_sel],
+                                 u["id_usuario"], inicio, fin, int(antisnip), apertura))
+                            id_nueva = int(cur.fetchone()[0])
+                            cur.executemany(
+                                "INSERT INTO Reglas_Incremento (id_subasta, monto_desde, "
+                                "monto_hasta, incremento_minimo) VALUES (?, ?, ?, ?)",
+                                [(id_nueva, 0.0, 1000.0, inc1),
+                                 (id_nueva, 1000.0, 10000.0, inc2),
+                                 (id_nueva, 10000.0, None, inc3)])
                         st.success(f"Subasta #{id_nueva} creada y activa. 🎉 "
                                    f"Abre en {art_obj['codigo_moneda']} {apertura:,.2f}.")
                         st.rerun()
                     except pyodbc.Error as ex:
-                        conn.rollback()
                         st.error(f"Error creando la subasta: {ex.args[-1] if ex.args else ex}")
 
     # ---------------- CERRAR SUBASTAS ----------------

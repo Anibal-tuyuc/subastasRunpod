@@ -7,6 +7,7 @@ RunPod:  streamlit run app.py --server.address 0.0.0.0 --server.port 8501 --serv
 """
 import os
 import io
+import secrets
 import pyodbc
 import streamlit as st
 from datetime import datetime, timezone, timedelta
@@ -345,17 +346,47 @@ def es_admin(id_usuario):
     return bool(filas)
 
 
-def login_por_id(id_usuario):
+def crear_token_sesion(id_usuario):
+    """Genera un token aleatorio de 256 bits y lo guarda en la BD.
+    Es lo que viaja en la URL (?st=...) — a diferencia del id numerico,
+    no se puede adivinar ni enumerar (2^256 combinaciones)."""
+    token = secrets.token_urlsafe(32)
+    with transaccion() as cursor:
+        cursor.execute(
+            "UPDATE Usuarios SET token_sesion = ? WHERE id_usuario = ?",
+            (token, id_usuario),
+        )
+    return token
+
+
+def login_por_token(token):
+    """Restaura la sesion desde el token de la URL. Solo acepta tokens
+    que existan en la BD; un token invalido o adivinado simplemente
+    devuelve None y muestra el login."""
+    if not token or len(token) > 64:
+        return None
     filas = query(
         "SELECT id_usuario, nombre, apellido FROM Usuarios "
-        "WHERE id_usuario = ? AND activo = 1",
-        (id_usuario,),
+        "WHERE token_sesion = ? AND activo = 1",
+        (token,),
     )
     if not filas:
         return None
     usr = filas[0]
     usr["es_admin"] = es_admin(usr["id_usuario"])
     return usr
+
+
+def cerrar_sesion_bd(id_usuario):
+    """Invalida el token en la BD: la URL vieja deja de funcionar."""
+    try:
+        with transaccion() as cursor:
+            cursor.execute(
+                "UPDATE Usuarios SET token_sesion = NULL WHERE id_usuario = ?",
+                (id_usuario,),
+            )
+    except pyodbc.Error:
+        pass  # Si la columna aun no existe (BD sin migrar), no bloquear el logout
 
 
 def registrar_usuario(nombre, apellido, email, password):
@@ -485,17 +516,22 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ============================================================
-# SESION - persistida en query params (?uid=N) para sobrevivir
+# SESION - persistida en query params (?st=TOKEN) para sobrevivir
 # recargas manuales del navegador y reruns.
+# SEGURIDAD: el parametro es un token aleatorio de 256 bits guardado
+# en Usuarios.token_sesion, NO el id del usuario. Un id numerico en la
+# URL (esquema anterior ?uid=N) permitia entrar a la cuenta de
+# cualquiera con solo cambiar el numero (IDOR). El token solo lo conoce
+# el navegador que hizo login, y se invalida al cerrar sesion.
 # ============================================================
 if "usuario" not in st.session_state:
     st.session_state.usuario = None
 
-if st.session_state.usuario is None and "uid" in st.query_params:
-    try:
-        st.session_state.usuario = login_por_id(int(st.query_params["uid"]))
-    except (ValueError, pyodbc.Error):
-        st.session_state.usuario = None
+if st.session_state.usuario is None and "st" in st.query_params:
+    st.session_state.usuario = login_por_token(st.query_params["st"])
+    if st.session_state.usuario is None:
+        # Token invalido, expirado o ya cerrado: limpiar la URL
+        del st.query_params["st"]
 
 if st.session_state.usuario is None:
     col_a, col_b, col_c = st.columns([1, 2, 1])
@@ -547,7 +583,7 @@ input:-webkit-autofill { animation-name: onAutoFillStart; }
                     u_log = login(email.strip(), pwd)
                     if u_log:
                         st.session_state.usuario = u_log
-                        st.query_params["uid"] = str(u_log["id_usuario"])
+                        st.query_params["st"] = crear_token_sesion(u_log["id_usuario"])
                         st.rerun()
                     else:
                         st.error("Credenciales inválidas o usuario inactivo.")
@@ -575,6 +611,7 @@ input:-webkit-autofill { animation-name: onAutoFillStart; }
 u = st.session_state.usuario
 st.sidebar.markdown(f"### 👤 {u['nombre']} {u['apellido']}")
 if st.sidebar.button("Cerrar sesión"):
+    cerrar_sesion_bd(u["id_usuario"])  # invalida el token en la BD
     st.session_state.usuario = None
     st.query_params.clear()
     st.rerun()

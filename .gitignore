@@ -1,0 +1,43 @@
+# ============================================================
+# .gitignore - Proyecto Subastas UMG
+# ============================================================
+
+# ---- CREDENCIALES: NUNCA SUBIR ----
+# Llave privada de Google Cloud (era de la epoca de Google Drive,
+# la app ahora usa Cloudinary). Contiene la private_key real.
+service_account.json
+app/service_account.json
+*.pem
+*.key
+.env
+.env.local
+
+# ---- Datos / backups locales (pesados o con datos sensibles) ----
+*.bak
+runpod_deploy.zip
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# ---- Streamlit ----
+.streamlit/secrets.toml
+
+# ---- SO / editores ----
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# ---- Logs / temporales ----
+*.log
+tmp/
+temp/

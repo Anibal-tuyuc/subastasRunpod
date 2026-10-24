@@ -7,6 +7,7 @@ RunPod:  streamlit run app.py --server.address 0.0.0.0 --server.port 8501 --serv
 """
 import os
 import io
+import re
 import secrets
 import pyodbc
 import streamlit as st
@@ -42,7 +43,8 @@ DB_USER = os.environ.get("DB_USER", "")       # vacio = Windows Auth (local)
 DB_PASS = os.environ.get("DB_PASS", "")
 DB_TRUSTED = os.environ.get("DB_TRUSTED", "yes" if not DB_USER else "no")
 
-PAGINAS = ["🏷️ Catálogo", "🔨 Sala de puja", "📋 Mis Pujas", "📦 Mis Artículos"]
+PAGINAS = ["🏷️ Catálogo", "🔨 Sala de puja", "📋 Mis Pujas", "📦 Mis Artículos",
+           "👤 Mi perfil"]
 
 
 @st.cache_resource
@@ -310,7 +312,52 @@ def _hashear(password_plano):
                          bcrypt.gensalt()).decode("utf-8")
 
 
+# ---------------- VALIDACION DE CORREO Y DATOS PERSONALES ----------------
+# El correo es el identificador exclusivo de la cuenta (no hay nombre de
+# usuario): se normaliza (sin espacios, en minusculas) y se valida en la
+# capa de servidor, no solo en la UI. Los limites respetan el DDL:
+# Usuarios.email varchar(150), nombre/apellido varchar(100), telefono varchar(20).
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
+MAX_EMAIL = 150
+MAX_NOMBRE = 100
+MAX_TELEFONO = 20
+
+
+def normalizar_email(email):
+    """Recorta espacios y pasa a minusculas. Devuelve '' si no hay valor."""
+    return (email or "").strip().lower()
+
+
+def validar_email(email):
+    """Devuelve (es_valido, mensaje_error) sobre el correo YA normalizado."""
+    if not email:
+        return False, "El correo es obligatorio."
+    if len(email) > MAX_EMAIL:
+        return False, f"El correo no puede superar {MAX_EMAIL} caracteres."
+    if not _EMAIL_RE.match(email):
+        return False, "El correo no tiene un formato valido."
+    return True, ""
+
+
+def validar_datos_personales(nombre, apellido, telefono):
+    """Valida nombre/apellido/telefono contra el esquema. Devuelve mensaje
+    de error o '' si todo es valido. El telefono puede ir vacio (NULL)."""
+    if not nombre or not nombre.strip():
+        return "El nombre es obligatorio."
+    if not apellido or not apellido.strip():
+        return "El apellido es obligatorio."
+    if len(nombre.strip()) > MAX_NOMBRE or len(apellido.strip()) > MAX_NOMBRE:
+        return f"Nombre y apellido no pueden superar {MAX_NOMBRE} caracteres."
+    if telefono and len(telefono.strip()) > MAX_TELEFONO:
+        return f"El telefono no puede superar {MAX_TELEFONO} caracteres."
+    return ""
+
+
 def login(email, password):
+    email = normalizar_email(email)
+    ok, _msg = validar_email(email)
+    if not ok:
+        return None
     filas = query(
         "SELECT id_usuario, nombre, apellido, password_hash FROM Usuarios "
         "WHERE email = ? AND activo = 1",
@@ -390,6 +437,15 @@ def cerrar_sesion_bd(id_usuario):
 
 
 def registrar_usuario(nombre, apellido, email, password):
+    email = normalizar_email(email)
+    ok, msg = validar_email(email)
+    if not ok:
+        return False, msg
+    msg = validar_datos_personales(nombre, apellido, None)
+    if msg:
+        return False, msg
+    nombre = nombre.strip()
+    apellido = apellido.strip()
     if len(password) < 6:
         return False, "La contraseña debe tener al menos 6 caracteres."
     id_verif = query(
@@ -416,6 +472,31 @@ def registrar_usuario(nombre, apellido, email, password):
         return True, "Registro exitoso. Ya puedes iniciar sesion."
     except pyodbc.IntegrityError:
         return False, "Ese email ya esta registrado."
+
+
+def actualizar_perfil(id_usuario, nombre, apellido, email, telefono):
+    """Actualiza SOLO datos personales de la propia cuenta (Mi perfil).
+    Rol, estado, verificacion, contraseña, fechas y token quedan fuera."""
+    email = normalizar_email(email)
+    ok, msg = validar_email(email)
+    if not ok:
+        return False, msg
+    msg = validar_datos_personales(nombre, apellido, telefono)
+    if msg:
+        return False, msg
+    telefono_db = (telefono or "").strip() or None
+    try:
+        with transaccion() as cursor:
+            cursor.execute(
+                "UPDATE Usuarios SET nombre = ?, apellido = ?, email = ?, "
+                "telefono = ? WHERE id_usuario = ?",
+                (nombre.strip(), apellido.strip(), email, telefono_db, id_usuario),
+            )
+        return True, "Perfil actualizado correctamente."
+    except pyodbc.IntegrityError:
+        return False, "Ese correo ya pertenece a otra cuenta."
+    except pyodbc.Error as ex:
+        return False, f"No se pudo guardar: {ex.args[-1] if ex.args else ex}"
 
 
 # ---------------- HELPERS UI ----------------
@@ -1190,6 +1271,62 @@ elif pagina == "📦 Mis Artículos":
                                "Un Admin ya puede crearle una subasta desde 🛠️ Admin.")
                 except pyodbc.Error as ex:
                     st.error(f"Error registrando: {ex.args[-1] if ex.args else ex}")
+
+# ============================================================
+# VISTA: Mi perfil - consulta y actualizacion de datos personales
+# de la propia cuenta (nombre, apellido, email, telefono). Rol,
+# estado, verificacion, contraseña, fechas y token NO se tocan.
+# ============================================================
+elif pagina == "👤 Mi perfil":
+    st.markdown("## Mi perfil")
+    st.caption("Datos personales de tu cuenta. El correo es tu identificador "
+               "de acceso; si lo cambias, inicia sesión con el nuevo correo.")
+
+    perfil = query(
+        "SELECT nombre, apellido, email, telefono FROM Usuarios "
+        "WHERE id_usuario = ?",
+        (u["id_usuario"],),
+    )
+    if not perfil:
+        st.error("No se encontró la cuenta en la base de datos.")
+        st.stop()
+    perfil = perfil[0]
+
+    with st.form("form_perfil"):
+        c1, c2 = st.columns(2)
+        f_nombre = c1.text_input("Nombre", value=perfil["nombre"],
+                                 max_chars=MAX_NOMBRE)
+        f_apellido = c2.text_input("Apellido", value=perfil["apellido"],
+                                   max_chars=MAX_NOMBRE)
+        f_email = st.text_input("Correo electrónico", value=perfil["email"],
+                                max_chars=MAX_EMAIL, autocomplete="email")
+        f_telefono = st.text_input("Teléfono (opcional)",
+                                   value=perfil["telefono"] or "",
+                                   max_chars=MAX_TELEFONO,
+                                   autocomplete="tel")
+        guardar = st.form_submit_button("Guardar cambios", width='stretch')
+
+    if guardar:
+        # Validacion en UI antes de tocar la BD (el servidor revalida)
+        f_email_n = normalizar_email(f_email)
+        ok, msg = validar_email(f_email_n)
+        if not ok:
+            st.error(msg)
+        else:
+            msg = validar_datos_personales(f_nombre, f_apellido, f_telefono)
+            if msg:
+                st.error(msg)
+            else:
+                ok, msg = actualizar_perfil(u["id_usuario"], f_nombre,
+                                            f_apellido, f_email_n, f_telefono)
+                if ok:
+                    # Reflejar el cambio en el encabezado lateral al instante
+                    st.session_state.usuario["nombre"] = f_nombre.strip()
+                    st.session_state.usuario["apellido"] = f_apellido.strip()
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
 
 # ============================================================
 # [INTEGRANTE C - Backend] VISTA: Panel Admin - crear/cerrar
